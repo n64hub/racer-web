@@ -6,7 +6,7 @@
 #endif
 
 #include <SDL.h>
-#ifndef __linux__
+#if !defined(__linux__) && !defined(__EMSCRIPTEN__)
 #include <SDL_syswm.h> // on Linux it brings X11's macros (None) into the runtime's headers
 #endif
 
@@ -72,7 +72,7 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     }
     ui_attach_window(g_window);
 
-#ifndef __linux__
+#if !defined(__linux__) && !defined(__EMSCRIPTEN__)
     SDL_SysWMinfo wminfo;
     SDL_VERSION(&wminfo.version);
     SDL_GetWindowWMInfo(g_window, &wminfo);
@@ -86,7 +86,7 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
     SDL_MetalView view = SDL_Metal_CreateView(g_window);
     return { wminfo.info.cocoa.window, SDL_Metal_GetLayer(view) };
 #else
-    return g_window; // rt64_context.cpp takes the X11 display and window from it
+    return g_window; // rt64_context.cpp takes the X11 display and window from it (on a page, the canvas)
 #endif
 }
 
@@ -96,6 +96,7 @@ void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t) {
         input_handle_event(e);
         if (e.type == SDL_QUIT) { quit(); continue; }
         if (ui_handle_event(e)) continue;
+#ifndef __EMSCRIPTEN__ // a page fills the browser's window, and goes fullscreen only from the browser
         if (e.type == SDL_KEYDOWN) {
             // F11 or Alt+Enter toggles borderless fullscreen.
             const SDL_Keysym& k = e.key.keysym;
@@ -105,6 +106,7 @@ void update_gfx(ultramodern::gfx_callbacks_t::gfx_data_t) {
                 save_config();
             }
         }
+#endif
     }
     ui_frame();
 }
@@ -207,6 +209,13 @@ void apply_window_config() {
 int run(const GameInfo& game, recomp::Configuration& cfg, int argc, char** argv) {
     g_game = game;
     g_base = std::filesystem::current_path();
+#ifdef __EMSCRIPTEN__
+    // A page keeps the config, the ROM it was given and the saves under $HOME (/home/web_user), which the browser
+    // keeps (N64Recomp-browser's persistent_home.js). RT64 keeps its own there too.
+    g_base = "/home/web_user/.config/" + g_game.short_name;
+    std::filesystem::create_directories(g_base);
+    std::filesystem::current_path(g_base);
+#endif
 #ifdef __ANDROID__
     // No writable working folder on Android: use the app's internal storage, and on the first run
     // take out the ROM that scripts/build_android.sh packed into the APK's assets.

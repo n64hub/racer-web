@@ -4,6 +4,10 @@
 // that's the real queue. In deterministic mode (netplay) the real queue differs per machine, which
 // would change what the game does, so the answer comes from game time instead: what the game queued
 // minus what game time says has played. Both machines then mix the same amounts.
+//
+// On a page the sound goes to N64Recomp-browser's output (audio_output.h) in place of SDL's queue, whose callback runs
+// on the page's thread, where WebGPU's work runs too, and breaks up whenever that thread is busy. The output plays at
+// the page's rate, so the game's buffers are resampled to it here, and its queue is counted back in the game's frames.
 
 #include <SDL.h>
 
@@ -15,6 +19,9 @@
 
 #include "config.hpp"
 #include "internal.hpp"
+#ifdef __EMSCRIPTEN__
+#include "audio_output.h"
+#endif
 
 namespace fe {
 namespace {
@@ -29,6 +36,41 @@ uint64_t g_det_queued = 0;
 uint64_t g_det_first_retrace = 0;
 bool g_det_started = false;
 
+#ifdef __EMSCRIPTEN__
+uint32_t g_output_rate = 0;  // the page's audio context's
+double g_resample_pos = 0.0; // where the next output frame falls, in input frames after g_last
+float g_last[kChannels] = {};
+
+void open_device(uint32_t rate) {
+    if (g_output_rate == 0) g_output_rate = n64recomp_browser::audio::open(kChannels);
+    g_device = 1;
+    printf("[audio] %u Hz, played at %u Hz\n", rate, g_output_rate);
+}
+
+// Linear interpolation from the game's rate to the output's, carried across buffers.
+void output(const float* in, size_t frames) {
+    static std::vector<float> out;
+    const double step = (double)g_rate / g_output_rate;
+    out.clear();
+    for (;;) {
+        const size_t i = (size_t)g_resample_pos; // between input frame i - 1 (g_last when 0) and i
+        if (i >= frames) break;
+        const float t = (float)(g_resample_pos - i);
+        for (int c = 0; c < kChannels; c++) {
+            const float a = i == 0 ? g_last[c] : in[(i - 1) * kChannels + c];
+            out.push_back(a + (in[i * kChannels + c] - a) * t);
+        }
+        g_resample_pos += step;
+    }
+    g_resample_pos -= frames;
+    if (frames) for (int c = 0; c < kChannels; c++) g_last[c] = in[(frames - 1) * kChannels + c];
+    n64recomp_browser::audio::queue(out.data(), out.size() / kChannels);
+}
+
+size_t device_queued_frames() {
+    return g_output_rate ? (size_t)((uint64_t)n64recomp_browser::audio::queued_frames() * g_rate / g_output_rate) : 0;
+}
+#else
 void open_device(uint32_t rate) {
     if (g_device) SDL_CloseAudioDevice(g_device);
     SDL_AudioSpec want{}, have{};
@@ -42,6 +84,15 @@ void open_device(uint32_t rate) {
     printf("[audio] %u Hz\n", rate);
 }
 
+void output(const float* frames, size_t count) {
+    SDL_QueueAudio(g_device, frames, (Uint32)(count * kBytesPerFrame));
+}
+
+size_t device_queued_frames() {
+    return SDL_GetQueuedAudioSize(g_device) / kBytesPerFrame;
+}
+#endif
+
 void queue_samples(int16_t* data, size_t count) {
     if (det_enabled()) {
         if (!g_det_started) { g_det_started = true; g_det_first_retrace = det_frame(); }
@@ -50,7 +101,7 @@ void queue_samples(int16_t* data, size_t count) {
     if (!g_device) return;
     // ponytail: in deterministic mode game time and the sound card drift apart slowly; drop a buffer
     // when the queue passes 200 ms rather than resampling.
-    if (det_enabled() && SDL_GetQueuedAudioSize(g_device) > g_rate * kBytesPerFrame / 5) return;
+    if (det_enabled() && device_queued_frames() > g_rate / 5) return;
 
     static std::vector<float> out;
     out.resize(count);
@@ -66,7 +117,7 @@ void queue_samples(int16_t* data, size_t count) {
         for (size_t i = 0; i + 1 < count; i += 2) { int16_t lr[2] = { data[i + 1], data[i] }; std::fwrite(lr, sizeof(lr), 1, dump); }
         std::fflush(dump);
     }
-    SDL_QueueAudio(g_device, out.data(), (Uint32)(count * sizeof(float)));
+    output(out.data(), count / kChannels);
 }
 
 size_t queued_frames() {
@@ -76,7 +127,7 @@ size_t queued_frames() {
         return g_det_queued > played ? (size_t)(g_det_queued - played) : 0;
     }
     // (The runtime reports half a frame less than this, so the game mixes a little ahead.)
-    return g_device ? SDL_GetQueuedAudioSize(g_device) / kBytesPerFrame : 0;
+    return g_device ? device_queued_frames() : 0;
 }
 
 // Never report more than two video frames' worth. Real hardware never has more queued than that,

@@ -1,0 +1,691 @@
+diff --git a/librecomp/CMakeLists.txt b/librecomp/CMakeLists.txt
+index 7ef8ace..29db7f0 100644
+--- a/librecomp/CMakeLists.txt
++++ b/librecomp/CMakeLists.txt
+@@ -4,6 +4,8 @@ project(librecomp)
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED True)
+ set(CMAKE_CXX_EXTENSIONS OFF)
++set(CMAKE_C_STANDARD 11)
++set(CMAKE_C_STANDARD_REQUIRED True)
+ 
+ # Define the library
+ add_library(librecomp STATIC
+@@ -50,11 +52,13 @@ target_include_directories(librecomp PRIVATE
+     "${CMAKE_CURRENT_SOURCE_DIR}/include/librecomp"
+ )
+ 
+-target_compile_options(librecomp PRIVATE
+-#    -Wall
+-#    -Wextra
+-    -Wno-unused-parameter
+-)
++if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
++    target_compile_options(librecomp PRIVATE
++    #    -Wall
++    #    -Wextra
++        -Wno-unused-parameter
++    )
++endif()
+ 
+ if (WIN32)
+     add_compile_definitions(NOMINMAX)
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index f5b4170..67f3573 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -6,8 +6,17 @@
+ #include "recomp.h"
+ 
+ namespace recomp {
+-    // 512GB (kseg0 size)
+-    constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
++    // 512MB (kseg0 size): the part of the address space that is readable/writable.
++    constexpr size_t kseg0_size = 512ULL * 1024ULL * 1024ULL;
++    // A title whose own code touches hardware registers directly (kseg1, 0xA4000000+)
++    // can raise this with RECOMP_MEM_SIZE_MB so those accesses land in scratch memory
++    // instead of faulting. The heap never extends past kseg0_size either way.
++#ifdef RECOMP_MEM_SIZE_MB
++    constexpr size_t mem_size = RECOMP_MEM_SIZE_MB * 1024ULL * 1024ULL;
++    static_assert(mem_size >= kseg0_size);
++#else
++    constexpr size_t mem_size = kseg0_size;
++#endif
+     // 4GB (the full address space)
+ #ifdef __EMSCRIPTEN__
+     // A 32-bit address space can't reserve 4 GiB, and WebAssembly memory has no page protection to catch stray
+diff --git a/librecomp/src/heap.cpp b/librecomp/src/heap.cpp
+index f84ac71..a2e27bd 100644
+--- a/librecomp/src/heap.cpp
++++ b/librecomp/src/heap.cpp
+@@ -35,7 +35,7 @@ void recomp::init_heap(uint8_t* rdram, uint32_t address) {
+ 
+     // Calculate the offset of the heap from the start of rdram and the size of the heap.
+     heap_offset = address - 0x80000000U;
+-    size_t heap_size = recomp::mem_size - heap_offset;
++    size_t heap_size = recomp::kseg0_size - heap_offset;
+ 
+     printf("Initializing recomp heap at offset 0x%08X with size 0x%08X\n", heap_offset, static_cast<uint32_t>(heap_size));
+ 
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index 71ee4d9..14a4072 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -162,8 +162,21 @@ void saving_thread_func(RDRAM_ARG1) {
+     }
+ }
+ 
++// Save accesses come straight from game code. Check them in every build type: an access past
++// the buffer (usually a wrong SaveType for the title) would otherwise corrupt the heap.
++static bool save_range_ok(uint32_t offset, uint32_t count, const char* what) {
++    if ((uint64_t)offset + count <= save_context.save_buffer.size()) {
++        return true;
++    }
++    fprintf(stderr, "[save] %s out of range: offset 0x%X count 0x%X, save size 0x%zX (wrong save type?)\n",
++        what, offset, count, save_context.save_buffer.size());
++    return false;
++}
++
+ void save_write_ptr(const void* in, uint32_t offset, uint32_t count) {
+-    assert(offset + count <= save_context.save_buffer.size());
++    if (!save_range_ok(offset, count, "write")) {
++        return;
++    }
+ 
+     {
+         std::lock_guard lock { save_context.save_buffer_mutex };
+@@ -174,7 +187,9 @@ void save_write_ptr(const void* in, uint32_t offset, uint32_t count) {
+ }
+ 
+ void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t count) {
+-    assert(offset + count <= save_context.save_buffer.size());
++    if (!save_range_ok(offset, count, "write")) {
++        return;
++    }
+ 
+     {
+         std::lock_guard lock { save_context.save_buffer_mutex };
+@@ -187,7 +202,9 @@ void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t cou
+ }
+ 
+ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t count) {
+-    assert(offset + count <= save_context.save_buffer.size());
++    if (!save_range_ok(offset, count, "read")) {
++        return;
++    }
+ 
+     std::lock_guard lock { save_context.save_buffer_mutex };
+     for (gpr i = 0; i < count; i++) {
+@@ -196,7 +213,9 @@ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t coun
+ }
+ 
+ void save_clear(uint32_t start, uint32_t size, char value) {
+-    assert(start + size < save_context.save_buffer.size());
++    if (!save_range_ok(start, size, "clear")) {
++        return;
++    }
+ 
+     {
+         std::lock_guard lock { save_context.save_buffer_mutex };
+@@ -362,6 +381,21 @@ extern "C" void osEPiReadIo_recomp(RDRAM_ARG recomp_context * ctx) {
+     ctx->r2 = 0;
+ }
+ 
++// osPiReadIo(devAddr, *data): libultra reads osRomBase | devAddr, where osRomBase is the
++// cartridge's KSEG1 base (0xB0000000).
++extern "C" void osPiReadIo_recomp(RDRAM_ARG recomp_context * ctx) {
++    uint32_t physical_addr = k1_to_phys(phys_to_k1(recomp::rom_base) | (uint32_t)ctx->r4);
++    gpr dramAddr = ctx->r5;
++
++    if (physical_addr >= recomp::rom_base) {
++        recomp::do_rom_pio(PASS_RDRAM dramAddr, physical_addr);
++    } else {
++        assert(false && "osPiReadIo below cartridge ROM unimplemented");
++    }
++
++    ctx->r2 = 0;
++}
++
+ extern "C" void osPiGetStatus_recomp(RDRAM_ARG recomp_context * ctx) {
+     ctx->r2 = 0;
+ }
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 5f4e876..5c05aa9 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -1067,17 +1067,6 @@ void recomp::start(const recomp::Configuration& cfg) {
+     ultramodern::join_thread_cleaner_thread();
+     ultramodern::join_saving_thread();
+     
+-    // Free rdram.
+-    bool free_failed;
+-#ifdef _WIN32
+-    // VirtualFree returns zero on failure.
+-    free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
+-#else
+-    // munmap returns -1 on failure.
+-    free_failed = (munmap(rdram, allocation_size) == -1);
+-#endif
+-
+-    if (free_failed) {
+-        printf("Failed to free rdram\n");
+-    }
++    // rdram is left for the OS to free at exit: the game's own threads (osCreateThread) aren't
++    // joined and may still be running, and unmapping it under them crashes them on Linux and macOS.
+ }
+diff --git a/librecomp/src/ultra_translation.cpp b/librecomp/src/ultra_translation.cpp
+index e0d367e..2b8c824 100644
+--- a/librecomp/src/ultra_translation.cpp
++++ b/librecomp/src/ultra_translation.cpp
+@@ -70,7 +70,8 @@ extern "C" void osViSetEvent_recomp(uint8_t * rdram, recomp_context * ctx) {
+ }
+ 
+ extern "C" void osGetCount_recomp(uint8_t * rdram, recomp_context * ctx) {
+-    ctx->r2 = osGetCount();
++    // mfc0 sign-extends: games compare this against counts loaded with lw.
++    ctx->r2 = (int32_t)osGetCount();
+ }
+ 
+ extern "C" void osSetCount_recomp(uint8_t * rdram, recomp_context * ctx) {
+diff --git a/ultramodern/CMakeLists.txt b/ultramodern/CMakeLists.txt
+index eee7f00..bcae0fe 100644
+--- a/ultramodern/CMakeLists.txt
++++ b/ultramodern/CMakeLists.txt
+@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
+ add_library(ultramodern STATIC
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/error_handling.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/deterministic.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/events.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/extensions.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/input.cpp"
+@@ -30,11 +31,13 @@ target_include_directories(ultramodern PUBLIC
+     "${PROJECT_SOURCE_DIR}/../thirdparty/sse2neon"
+ )
+ 
+-target_compile_options(ultramodern PRIVATE
+-#    -Wall
+-#    -Wextra
+-    -Wno-unused-parameter
+-)
++if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
++    target_compile_options(ultramodern PRIVATE
++    #    -Wall
++    #    -Wextra
++        -Wno-unused-parameter
++    )
++endif()
+ 
+ if (WIN32)
+     add_compile_definitions(NOMINMAX)
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index da24a61..16b3e47 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -104,6 +104,21 @@ void submit_rsp_task(RDRAM_ARG PTR(OSTask) task);
+ void send_si_message();
+ uint32_t get_speed_multiplier();
+ 
++// Deterministic mode (opt-in, for lockstep netplay and replays). Game time stops following the host
++// clock: it advances only when every game thread is blocked, and VI retraces, timers and RSP/RDP
++// completions are delivered at those points in a fixed order. The same inputs then give the same
++// game state on every machine. Requires the game to have an idle thread (one that ends in an
++// infinite loop, recompiled to pause_self). Call enable() before recomp::start.
++namespace det {
++    void enable();
++    bool enabled();
++    // Called on a game thread at every virtual VI retrace, before it is delivered; retrace counts
++    // from 0. It may block, which is how lockstep waits for a remote player's inputs.
++    using frame_callback_t = void (*)(uint64_t retrace);
++    void set_frame_callback(frame_callback_t callback);
++    uint64_t retrace_count();
++}
++
+ // Time
+ std::chrono::high_resolution_clock::time_point get_start();
+ std::chrono::high_resolution_clock::duration time_since_start();
+diff --git a/ultramodern/src/deterministic.cpp b/ultramodern/src/deterministic.cpp
+new file mode 100644
+index 0000000..a2e0aa5
+--- /dev/null
++++ b/ultramodern/src/deterministic.cpp
+@@ -0,0 +1,89 @@
++// Deterministic mode: the scheduler side. See ultramodern::det in ultramodern.hpp.
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++
++#include "deterministic.hpp"
++
++void dequeue_external_messages(RDRAM_ARG1); // mesgqueue.cpp
++
++namespace {
++std::atomic_bool enabled_flag = false;
++ultramodern::det::frame_callback_t frame_callback = nullptr;
++
++// Only game threads touch these, and only one game thread runs at a time.
++uint64_t virtual_now = 0;     // CPU counter ticks
++uint32_t reads_since_advance = 0;
++uint64_t retraces = 0;
++bool pacing_started = false;
++std::chrono::high_resolution_clock::time_point pacing_start;
++
++constexpr uint64_t counter_per_second = 46'875'000;
++constexpr uint64_t ticks_per_retrace = counter_per_second / 60;
++// Each clock read moves time on by this much (~1.4 us), so code that spins on the clock finishes.
++constexpr uint64_t ticks_per_read = 64;
++} // namespace
++
++void ultramodern::det::enable() { enabled_flag = true; }
++bool ultramodern::det::enabled() { return enabled_flag; }
++void ultramodern::det::set_frame_callback(frame_callback_t callback) { frame_callback = callback; }
++uint64_t ultramodern::det::retrace_count() { return retraces; }
++
++static uint8_t* det_rdram = nullptr; // the clock read path has no rdram argument
++
++static uint64_t next_event(RDRAM_ARG1) {
++    return std::min((retraces + 1) * ticks_per_retrace, ultramodern::det::next_timer_timestamp(PASS_RDRAM1));
++}
++
++// Moves virtual time to `t` (the next event) and posts what fires there. Runs on a game thread at a
++// deterministic point; the messages are picked up at the next send/receive.
++static void advance_to(RDRAM_ARG uint64_t t) {
++    // Keep virtual time from running ahead of real time (it may fall behind on a slow machine).
++    if (!pacing_started) {
++        pacing_started = true;
++        pacing_start = std::chrono::high_resolution_clock::now() - std::chrono::microseconds(virtual_now * 1'000'000 / counter_per_second);
++    }
++    ultramodern::sleep_until(pacing_start + std::chrono::microseconds(t * 1'000'000 / counter_per_second));
++
++    virtual_now = std::max(virtual_now, t);
++    reads_since_advance = 0;
++
++    ultramodern::det::fire_timers(PASS_RDRAM t);
++    if ((retraces + 1) * ticks_per_retrace <= t) {
++        if (frame_callback != nullptr) {
++            frame_callback(retraces);
++        }
++        ultramodern::det::vi_retrace(PASS_RDRAM1);
++        retraces++;
++    }
++}
++
++void ultramodern::det::set_rdram(RDRAM_ARG1) { det_rdram = rdram; }
++
++uint64_t ultramodern::det::now_for_read() {
++    uint64_t t = virtual_now + (uint64_t)(++reads_since_advance) * ticks_per_read;
++    // A game spinning on the clock reaches the next event this way, as hardware interrupts would.
++    if (det_rdram != nullptr) {
++        uint8_t* rdram = det_rdram;
++        const uint64_t e = next_event(PASS_RDRAM1);
++        if (t >= e) {
++            advance_to(PASS_RDRAM e);
++            t = virtual_now;
++        }
++    }
++    return t;
++}
++
++void ultramodern::det::idle(RDRAM_ARG1) {
++    det_rdram = rdram;
++    // Deliver what the game threads themselves queued (task completions, SI); that may wake one.
++    dequeue_external_messages(PASS_RDRAM1);
++    if (!ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
++        return;
++    }
++    // Nothing can run until the next event: move virtual time to it.
++    advance_to(PASS_RDRAM next_event(PASS_RDRAM1));
++    dequeue_external_messages(PASS_RDRAM1);
++}
+diff --git a/ultramodern/src/deterministic.hpp b/ultramodern/src/deterministic.hpp
+new file mode 100644
+index 0000000..7c3f195
+--- /dev/null
++++ b/ultramodern/src/deterministic.hpp
+@@ -0,0 +1,24 @@
++// Internals of deterministic mode shared between the scheduler (deterministic.cpp), the timers
++// (timer.cpp) and the event code (events.cpp). See ultramodern::det in ultramodern.hpp.
++#pragma once
++
++#include <cstdint>
++
++#include "ultramodern/ultra64.h"
++#include "ultramodern/ultramodern.hpp"
++
++namespace ultramodern::det {
++    // Virtual CPU counter ticks; each read also moves it on slightly so busy-waits on the clock end.
++    uint64_t now_for_read();
++    void set_rdram(RDRAM_ARG1);
++    // Called by the idle thread instead of waiting for host messages: advances virtual time to the
++    // next retrace or timer and delivers it.
++    void idle(RDRAM_ARG1);
++
++    // timer.cpp
++    uint64_t next_timer_timestamp(RDRAM_ARG1); // UINT64_MAX when no timer is active
++    void fire_timers(RDRAM_ARG uint64_t now);
++
++    // events.cpp: VI state swap plus the VI and AI messages for one retrace.
++    void vi_retrace(RDRAM_ARG1);
++}
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index feb748e..b5cc34d 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
++#include "deterministic.hpp"
+ #include "ultramodern/extensions.h"
+ 
+ #include "ultramodern/rsp.hpp"
+@@ -26,6 +27,9 @@ void ultramodern::events::set_callbacks(const ultramodern::events::callbacks_t&
+ 
+ struct SpTaskAction {
+     OSTask task;
++    // Deterministic mode: signalled once the renderer has parsed the display list, so the game
++    // (already told the task is done) can't overwrite it mid-parse.
++    moodycamel::LightweightSemaphore* parsed = nullptr;
+ };
+ 
+ struct ScreenUpdateAction {
+@@ -91,7 +95,11 @@ static struct {
+             ViState* next_state = get_next_state();
+             const OSViMode* next_mode = next_state->mode;
+             if (next_mode == nullptr) {
+-                // Skip the update if the next mode hasn't been set yet.
++                // No mode set yet: leave the registers alone, but still swap states so that
++                // osViSetEvent registrations take effect. Retraces happen regardless of mode,
++                // and a game may wait for one before it calls osViSetMode.
++                cur_state ^= 1;
++                *get_next_state() = *get_cur_state();
+                 return;
+             }
+ 
+@@ -406,6 +414,19 @@ void vi_thread_func() {
+ #else
+         // Queue a screen update for the graphics thread with the current VI register state.
+         // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
++        if (ultramodern::det::enabled() && ultramodern::is_game_started()) {
++            // Deterministic mode: retraces reach the game from det::idle (vi_retrace below); this thread only presents.
++            ultramodern::renderer::ViRegs regs;
++            {
++                std::lock_guard lock{ events_context.message_mutex };
++                regs = events_context.vi.regs;
++            }
++            events_context.action_queue.enqueue(ScreenUpdateAction{ regs });
++            if (events_callbacks.vi_callback != nullptr) {
++                events_callbacks.vi_callback();
++            }
++            continue;
++        }
+         events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+ 
+         // Update VI registers and swap VI modes.
+@@ -551,7 +572,9 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+                 // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
+                 // is finished as well, so sending this early shouldn't be an issue in most cases.
+                 // If this causes issues then the logic can be replaced with responding to yield requests.
+-                sp_complete();
++                if (!ultramodern::det::enabled()) {
++                    sp_complete();
++                }
+                 ultramodern::measure_input_latency();
+ 
+                 PTR(u64) displaylist = task_action->task.t.data_ptr;
+@@ -559,9 +582,14 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+ 
+                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
+                 renderer_context->send_dl(&task_action->task);
++                if (task_action->parsed != nullptr) {
++                    task_action->parsed->signal();
++                }
+                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+ 
+-                dp_complete();
++                if (!ultramodern::det::enabled()) {
++                    dp_complete();
++                }
+                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
+                 ultramodern::extensions::on_displaylist_parsed(displaylist);
+                 ultramodern::extensions::on_displaylist_completed(displaylist);
+@@ -652,6 +680,9 @@ extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
+     OSViMode* mode = TO_PTR(OSViMode, mode_);
+     ViState* next_state = events_context.vi.get_next_state();
+     next_state->mode = mode;
++    // libultra's osViSetMode overwrites the state (state = VI_STATE_MODE_UPDATED), which clears
++    // BLACK and REPEATLINE. Games rely on this to unblank the screen after osViBlack(TRUE).
++    next_state->state &= ~(VI_STATE_BLACK | VI_STATE_REPEATLINE);
+     next_state->control = next_state->mode->comRegs.ctrl;
+ }
+ 
+@@ -738,16 +769,43 @@ extern "C" void osViSetYScale(float scale) {
+ }
+ 
+ extern "C" PTR(void) osViGetNextFramebuffer() {
++    // A game polling this in a loop waits for a retrace; let virtual time reach it (deterministic mode).
++    if (ultramodern::det::enabled()) {
++        (void)ultramodern::det::now_for_read();
++    }
+     return events_context.vi.get_next_state()->framebuffer;
+ }
+ 
+ extern "C" PTR(void) osViGetCurrentFramebuffer() {
++    // A game polling this in a loop waits for a retrace; let virtual time reach it (deterministic mode).
++    if (ultramodern::det::enabled()) {
++        (void)ultramodern::det::now_for_read();
++    }
+     return events_context.vi.get_cur_state()->framebuffer;
+ }
+ 
+ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+     OSTask* task = TO_PTR(OSTask, task_);
+ 
++    // Deterministic mode: post completions from this (game) thread at a fixed point instead of from
++    // the task/gfx threads whenever they finish. Graphics still render on the gfx thread.
++    if (ultramodern::det::enabled()) {
++        if (task->t.type == M_GFXTASK) {
++            moodycamel::LightweightSemaphore parsed;
++            events_context.action_queue.enqueue(SpTaskAction{ *task, &parsed });
++            parsed.wait();
++            sp_complete();
++            dp_complete();
++        } else {
++            if (!ultramodern::rsp::run_task(PASS_RDRAM task)) {
++                fprintf(stderr, "Failed to execute task type: %" PRIu32 "\n", task->t.type);
++                ULTRAMODERN_QUICK_EXIT();
++            }
++            sp_complete();
++        }
++        return;
++    }
++
+     // Send gfx tasks to the graphics action queue
+     if (task->t.type == M_GFXTASK) {
+         events_context.action_queue.enqueue(SpTaskAction{ *task });
+@@ -758,6 +816,24 @@ void ultramodern::submit_rsp_task(RDRAM_ARG PTR(OSTask) task_) {
+     }
+ }
+ 
++// Deterministic mode's retrace (called from det::idle on a game thread): what vi_thread_func does
++// for the game on a host-timed retrace.
++void ultramodern::det::vi_retrace(RDRAM_ARG1) {
++    static int remaining_retraces = 1;
++    std::lock_guard lock{ events_context.message_mutex };
++    events_context.vi.update_vi();
++    ViState* cur_state = events_context.vi.get_cur_state();
++    if (--remaining_retraces <= 0) {
++        if (cur_state->mq != NULLPTR) {
++            ultramodern::enqueue_external_message_src(cur_state->mq, cur_state->msg, false, ultramodern::EventMessageSource::Vi);
++        }
++        remaining_retraces = cur_state->retrace_count;
++    }
++    if (events_context.ai.mq != NULLPTR) {
++        ultramodern::enqueue_external_message_src(events_context.ai.mq, events_context.ai.msg, false, ultramodern::EventMessageSource::Ai);
++    }
++}
++
+ void ultramodern::send_si_message() {
+     ultramodern::enqueue_external_message_src(events_context.si.mq, events_context.si.msg, false, ultramodern::EventMessageSource::Si);
+ }
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index b7a1a2a..ae0aee5 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
++#include "deterministic.hpp"
+ 
+ struct QueuedMessage {
+     PTR(OSMesgQueue) mq;
+@@ -35,7 +36,18 @@ void ultramodern::set_message_queue_control(const ultramodern::MessageQueueContr
+     requeue_enabled.set(static_cast<int>(EventMessageSource::Dp), mqc.requeue_dp);
+ }
+ 
++// In deterministic mode every message must come from a game thread (posted at a fixed point);
++// one from a host thread arrives at a host-timed moment and breaks determinism.
++static void check_deterministic_source() {
++    static bool warned = false;
++    if (ultramodern::det::enabled() && !ultramodern::is_game_thread() && !warned) {
++        warned = true;
++        fprintf(stderr, "[ultramodern] deterministic mode: a host thread posted a game message\n");
++    }
++}
++
+ void ultramodern::enqueue_external_message_src(PTR(OSMesgQueue) mq, OSMesg msg, bool jam, EventMessageSource src) {
++    check_deterministic_source();
+     external_messages.enqueue({mq, msg, jam, requeue_enabled[static_cast<int>(src)]});
+ }
+ 
+@@ -62,6 +74,10 @@ void dequeue_external_messages(RDRAM_ARG1) {
+ }
+ 
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
++    if (ultramodern::det::enabled()) {
++        ultramodern::det::idle(PASS_RDRAM1);
++        return;
++    }
+     QueuedMessage to_send;
+ #if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
+     if (QueuedMessage::send_blocked_messages(PASS_RDRAM1)) {
+@@ -75,6 +91,10 @@ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+ }
+ 
+ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
++    if (ultramodern::det::enabled()) {
++        ultramodern::det::idle(PASS_RDRAM1);
++        return;
++    }
+     QueuedMessage to_send;
+ #if ULTRAMODERN_HOLD_BLOCKED_MESSAGES
+     if (QueuedMessage::send_blocked_messages(PASS_RDRAM1)) {
+diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
+index 9c00296..962e61b 100644
+--- a/ultramodern/src/timer.cpp
++++ b/ultramodern/src/timer.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
++#include "deterministic.hpp"
+ 
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+@@ -96,6 +97,9 @@ std::chrono::high_resolution_clock::time_point ticks_to_timepoint(uint64_t ticks
+ }
+ 
+ uint64_t time_now() {
++    if (ultramodern::det::enabled()) {
++        return ultramodern::det::now_for_read();
++    }
+     return duration_to_ticks(std::chrono::high_resolution_clock::now() - start_time);
+ }
+ 
+@@ -237,7 +241,49 @@ void timer_thread(RDRAM_ARG1) {
+     }
+ }
+ 
++// Deterministic mode keeps active timers here (touched only by game threads) instead of using the
++// timer thread, and fires them from virtual time.
++struct DetTimerOrder {
++    uint8_t* rdram;
++    bool operator()(PTR(OSTimer) a_, PTR(OSTimer) b_) const {
++        OSTimer* a = TO_PTR(OSTimer, a_);
++        OSTimer* b = TO_PTR(OSTimer, b_);
++        if (a->timestamp != b->timestamp) {
++            return a->timestamp < b->timestamp;
++        }
++        return a_ < b_;
++    }
++};
++static std::set<PTR(OSTimer), DetTimerOrder>* det_timers = nullptr;
++
++static std::set<PTR(OSTimer), DetTimerOrder>& get_det_timers(RDRAM_ARG1) {
++    if (det_timers == nullptr) {
++        det_timers = new std::set<PTR(OSTimer), DetTimerOrder>(DetTimerOrder{ PASS_RDRAM1 });
++    }
++    return *det_timers;
++}
++
++uint64_t ultramodern::det::next_timer_timestamp(RDRAM_ARG1) {
++    auto& timers = get_det_timers(PASS_RDRAM1);
++    return timers.empty() ? UINT64_MAX : TO_PTR(OSTimer, *timers.begin())->timestamp;
++}
++
++void ultramodern::det::fire_timers(RDRAM_ARG uint64_t now) {
++    auto& timers = get_det_timers(PASS_RDRAM1);
++    while (!timers.empty() && TO_PTR(OSTimer, *timers.begin())->timestamp <= now) {
++        PTR(OSTimer) t_ = *timers.begin();
++        OSTimer* t = TO_PTR(OSTimer, t_);
++        timers.erase(timers.begin());
++        ultramodern::enqueue_external_message_src(t->mq, t->msg, false, ultramodern::EventMessageSource::Timer);
++        if (t->interval != 0) {
++            t->timestamp += t->interval;
++            timers.insert(t_);
++        }
++    }
++}
++
+ void ultramodern::init_timers(RDRAM_ARG1) {
++    ultramodern::det::set_rdram(PASS_RDRAM1);
+     timer_context.thread = std::thread{ timer_thread, PASS_RDRAM1 };
+     timer_context.thread.detach();
+ }
+@@ -278,6 +324,11 @@ extern "C" void osSetTime(OSTime t) {
+ extern "C" int osSetTimer(RDRAM_ARG PTR(OSTimer) t_, OSTime countdown, OSTime interval, PTR(OSMesgQueue) mq, OSMesg msg) {
+     OSTimer* t = TO_PTR(OSTimer, t_);
+ 
++    // In deterministic mode the set is ordered by timestamp, so take the timer out before changing it.
++    if (ultramodern::det::enabled()) {
++        get_det_timers(PASS_RDRAM1).erase(t_);
++    }
++
+     // Determine the time when this timer will trigger off
+     if (countdown == 0) {
+         // Set the timestamp based on the interval
+@@ -289,12 +340,21 @@ extern "C" int osSetTimer(RDRAM_ARG PTR(OSTimer) t_, OSTime countdown, OSTime in
+     t->mq = mq;
+     t->msg = msg;
+ 
++    if (ultramodern::det::enabled()) {
++        get_det_timers(PASS_RDRAM1).insert(t_);
++        return 0;
++    }
++
+     timer_context.action_queue.enqueue(AddTimerAction{ t_ });
+ 
+     return 0;
+ }
+ 
+ extern "C" int osStopTimer(RDRAM_ARG PTR(OSTimer) t_) {
++    if (ultramodern::det::enabled()) {
++        get_det_timers(PASS_RDRAM1).erase(t_);
++        return 0;
++    }
+     timer_context.action_queue.enqueue(RemoveTimerAction{ t_ });
+ 
+     // TODO don't blindly return 0 here; requires some response from the timer thread to know what the returned value was

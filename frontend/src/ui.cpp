@@ -3,7 +3,8 @@
 // The main thread (SDL events, the loop in recomp::start) builds an ImGui frame about 60 times a
 // second; RT64's present thread draws the latest one on top of the game at each present. g_mutex
 // guards the ImGui context between the two. It draws with whichever API RT64 picked: D3D12 on
-// Windows, Vulkan on Linux, Metal on macOS (as RT64's own inspector does).
+// Windows, Vulkan on Linux, Metal on macOS (as RT64's own inspector does). On a page it draws through
+// plume, as RT64's inspector does there (WebGPUOverlay below).
 //
 // ponytail: RT64's own inspector (developerMode) also uses ImGui's global context; don't open our
 // menu while it's showing.
@@ -14,10 +15,17 @@
 #endif
 
 #include "rhi/rt64_render_hooks.h"
+#ifdef __EMSCRIPTEN__
+#include "render/rt64_render_worker.h"
+#include "file_picker.h"
+#else
 #include "plume_vulkan.h" // volk, before ImGui's Vulkan backend
+#endif
 
 #include "imgui.h"
+#ifndef __EMSCRIPTEN__
 #include "backends/imgui_impl_vulkan.h"
+#endif
 #include "imgui/imgui_impl_sdl2_custom.h"
 #ifdef _WIN32
 #include "plume_d3d12.h"
@@ -49,7 +57,7 @@ namespace {
 
 // --- Rendering (RT64's present thread) -------------------------------------------------------
 
-enum class Api { None, D3D12, Vulkan, Metal };
+enum class Api { None, D3D12, Vulkan, Metal, WebGPU };
 
 std::mutex g_mutex;
 ImGuiContext* g_ctx = nullptr;
@@ -76,24 +84,262 @@ void srv_alloc(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12
 void srv_free(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE) {}
 #endif
 
+#ifdef __EMSCRIPTEN__
+// A page has only WebGPU, and its device belongs to the page's thread (plume_device_thread.h), so ImGui's own WebGPU
+// backend, which calls WebGPU on whatever thread draws, can't draw there. This draws ImGui's lists through plume, as
+// rt64-web's inspector does: ImGui's textures (its font atlases, ImGuiBackendFlags_RendererHasTextures) are textures
+// of its own, each frame's vertices and indices go in upload buffers, and one WGSL pipeline draws each command clipped
+// to its rectangle.
+const char kOverlayShader[] = R"(
+struct PushConstants {
+    scale: vec2<f32>,
+    translate: vec2<f32>,
+};
+
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var texSampler: sampler;
+@group(3) @binding(999) var<uniform> pushConstants: PushConstants;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+@vertex
+fn VSMain(@location(0) position: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32>) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = vec4<f32>(position * pushConstants.scale + pushConstants.translate, 0.0, 1.0);
+    output.color = color;
+    output.uv = uv;
+    return output;
+}
+
+@fragment
+fn PSMain(input: VertexOutput) -> @location(0) vec4<f32> {
+    return input.color * textureSample(tex, texSampler, input.uv);
+}
+)";
+
+struct WebGPUOverlay {
+    // A texture ImGui draws, kept in its ImTextureData's BackendUserData.
+    struct Texture {
+        std::unique_ptr<RenderTexture> texture;
+        std::unique_ptr<RenderDescriptorSet> set;
+    };
+
+    RenderDevice* device;
+    RenderDescriptorSetBuilder setBuilder;
+    std::unique_ptr<RenderSampler> sampler;
+    std::unique_ptr<RenderPipelineLayout> layout;
+    std::unique_ptr<RenderPipeline> pipeline;
+    std::unique_ptr<RenderBuffer> vertices, indices;
+    uint64_t vertexCapacity = 0, indexCapacity = 0;
+
+    explicit WebGPUOverlay(RenderDevice* device) : device(device) {
+        RenderSamplerDesc samplerDesc;
+        samplerDesc.addressU = samplerDesc.addressV = samplerDesc.addressW = RenderTextureAddressMode::CLAMP;
+        sampler = device->createSampler(samplerDesc);
+        setBuilder.begin();
+        setBuilder.addTexture(0);
+        setBuilder.addSampler(1);
+        setBuilder.end();
+        RenderPipelineLayoutBuilder layoutBuilder;
+        layoutBuilder.begin(false, true);
+        layoutBuilder.addPushConstant(0, 0, sizeof(float) * 4, RenderShaderStageFlag::VERTEX);
+        layoutBuilder.addDescriptorSet(setBuilder);
+        layoutBuilder.end();
+        layout = layoutBuilder.create(device);
+        std::unique_ptr<RenderShader> vs = device->createShader(kOverlayShader, sizeof(kOverlayShader), "VSMain", RenderShaderFormat::WGSL);
+        std::unique_ptr<RenderShader> ps = device->createShader(kOverlayShader, sizeof(kOverlayShader), "PSMain", RenderShaderFormat::WGSL);
+        const RenderInputSlot slot(0, sizeof(ImDrawVert));
+        const RenderInputElement elements[] = {
+            RenderInputElement("POSITION", 0, 0, RenderFormat::R32G32_FLOAT, 0, offsetof(ImDrawVert, pos)),
+            RenderInputElement("TEXCOORD", 0, 1, RenderFormat::R32G32_FLOAT, 0, offsetof(ImDrawVert, uv)),
+            RenderInputElement("COLOR", 0, 2, RenderFormat::R8G8B8A8_UNORM, 0, offsetof(ImDrawVert, col)),
+        };
+        RenderGraphicsPipelineDesc desc;
+        desc.pipelineLayout = layout.get();
+        desc.vertexShader = vs.get();
+        desc.pixelShader = ps.get();
+        desc.renderTargetFormat[0] = device->getCapabilities().preferredSwapChainFormat;
+        desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+        desc.renderTargetCount = 1;
+        desc.inputSlots = &slot;
+        desc.inputSlotsCount = 1;
+        desc.inputElements = elements;
+        desc.inputElementsCount = uint32_t(std::size(elements));
+        pipeline = device->createGraphicsPipeline(desc);
+    }
+
+    // Copies a rectangle of RGBA pixels into a texture with a worker of its own: the draw that asks is inside the
+    // present's render pass.
+    void upload(Texture& t, const uint8_t* pixels, uint32_t pitch, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+        if (w == 0 || h == 0) return;
+        const uint32_t rowPitch = (w * 4 + 255) & ~255U;
+        std::unique_ptr<RenderBuffer> buffer = device->createBuffer(RenderBufferDesc::UploadBuffer(uint64_t(rowPitch) * h));
+        uint8_t* data = static_cast<uint8_t*>(buffer->map());
+        for (uint32_t row = 0; row < h; row++) memcpy(data + uint64_t(rowPitch) * row, pixels + uint64_t(pitch) * row, w * 4);
+        buffer->unmap();
+        RT64::RenderWorker worker(device, "Overlay texture", RenderCommandListType::DIRECT);
+        RT64::RenderWorkerExecution execution(&worker);
+        worker.commandList->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(t.texture.get(), RenderTextureLayout::COPY_DEST));
+        worker.commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(t.texture.get()),
+            RenderTextureCopyLocation::PlacedFootprint(buffer.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, rowPitch / 4), x, y);
+        worker.commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(t.texture.get(), RenderTextureLayout::SHADER_READ));
+    }
+
+    // Does what ImGui asks of a texture first, as its own backends do.
+    void update(ImTextureData* tex) {
+        if (tex->Status == ImTextureStatus_WantCreate) {
+            Texture* t = new Texture;
+            t->texture = device->createTexture(RenderTextureDesc::Texture2D(tex->Width, tex->Height, 1, RenderFormat::R8G8B8A8_UNORM));
+            t->set = setBuilder.create(device);
+            t->set->setTexture(0, t->texture.get(), RenderTextureLayout::SHADER_READ);
+            t->set->setSampler(1, sampler.get());
+            tex->SetTexID(ImTextureID(t->set.get()));
+            tex->BackendUserData = t;
+        }
+        if (tex->Status == ImTextureStatus_WantCreate || tex->Status == ImTextureStatus_WantUpdates) {
+            const bool whole = tex->Status == ImTextureStatus_WantCreate;
+            const uint32_t x = whole ? 0 : tex->UpdateRect.x, y = whole ? 0 : tex->UpdateRect.y;
+            const uint32_t w = whole ? tex->Width : tex->UpdateRect.w, h = whole ? tex->Height : tex->UpdateRect.h;
+            upload(*static_cast<Texture*>(tex->BackendUserData), static_cast<const uint8_t*>(tex->GetPixelsAt(x, y)), tex->GetPitch(), x, y, w, h);
+            tex->SetStatus(ImTextureStatus_OK);
+        }
+        if (tex->Status == ImTextureStatus_WantDestroy && tex->UnusedFrames > 0) destroy(tex);
+    }
+
+    // ImGui makes the texture again when it next draws with it.
+    static void destroy(ImTextureData* tex) {
+        delete static_cast<Texture*>(tex->BackendUserData);
+        tex->SetTexID(ImTextureID_Invalid);
+        tex->BackendUserData = nullptr;
+        tex->SetStatus(ImTextureStatus_Destroyed);
+    }
+
+    void set_state(RenderCommandList* list, const ImDrawData* dd, uint32_t width, uint32_t height, uint32_t vbytes, uint32_t ibytes) {
+        const float push[4] = { 2.0f / dd->DisplaySize.x, -2.0f / dd->DisplaySize.y,
+            -1.0f - dd->DisplayPos.x * 2.0f / dd->DisplaySize.x, 1.0f + dd->DisplayPos.y * 2.0f / dd->DisplaySize.y };
+        const RenderVertexBufferView vview(vertices.get(), vbytes);
+        const RenderInputSlot slot(0, sizeof(ImDrawVert));
+        const RenderIndexBufferView iview(indices.get(), ibytes, sizeof(ImDrawIdx) == 2 ? RenderFormat::R16_UINT : RenderFormat::R32_UINT);
+        const RenderViewport viewport(0.0f, 0.0f, float(width), float(height));
+        list->setViewports(&viewport, 1);
+        list->setPipeline(pipeline.get());
+        list->setGraphicsPipelineLayout(layout.get());
+        list->setGraphicsPushConstants(0, push);
+        list->setVertexBuffers(0, &vview, 1, &slot);
+        list->setIndexBuffer(&iview);
+    }
+
+    // Draws over the swap chain's framebuffer, which the present has set. The present waits for its list before it
+    // records the next, so one pair of upload buffers does for every frame.
+    void draw(RenderCommandList* list, ImDrawData* dd, uint32_t width, uint32_t height) {
+        if (dd->Textures) for (ImTextureData* tex : *dd->Textures) if (tex->Status != ImTextureStatus_OK) update(tex);
+        if (dd->TotalVtxCount <= 0 || dd->DisplaySize.x <= 0 || dd->DisplaySize.y <= 0 || width == 0 || height == 0) return;
+        // WebGPU writes buffers 4 bytes at a time.
+        const uint32_t vbytes = (uint32_t(dd->TotalVtxCount * sizeof(ImDrawVert)) + 3) & ~3U;
+        const uint32_t ibytes = (uint32_t(dd->TotalIdxCount * sizeof(ImDrawIdx)) + 3) & ~3U;
+        if (vertexCapacity < vbytes) { vertexCapacity = vbytes * 2; vertices = device->createBuffer(RenderBufferDesc::VertexBuffer(vertexCapacity, RenderHeapType::UPLOAD)); }
+        if (indexCapacity < ibytes) { indexCapacity = ibytes * 2; indices = device->createBuffer(RenderBufferDesc::IndexBuffer(indexCapacity, RenderHeapType::UPLOAD)); }
+        ImDrawVert* vdata = static_cast<ImDrawVert*>(vertices->map());
+        ImDrawIdx* idata = static_cast<ImDrawIdx*>(indices->map());
+        for (const ImDrawList* dl : dd->CmdLists) {
+            memcpy(vdata, dl->VtxBuffer.Data, dl->VtxBuffer.Size * sizeof(ImDrawVert));
+            memcpy(idata, dl->IdxBuffer.Data, dl->IdxBuffer.Size * sizeof(ImDrawIdx));
+            vdata += dl->VtxBuffer.Size;
+            idata += dl->IdxBuffer.Size;
+        }
+        vertices->unmap();
+        indices->unmap();
+        set_state(list, dd, width, height, vbytes, ibytes);
+        const float sx = float(width) / dd->DisplaySize.x, sy = float(height) / dd->DisplaySize.y;
+        const RenderDescriptorSet* bound = nullptr;
+        int32_t vbase = 0;
+        uint32_t ibase = 0;
+        for (const ImDrawList* dl : dd->CmdLists) {
+            for (const ImDrawCmd& cmd : dl->CmdBuffer) {
+                if (cmd.UserCallback) {
+                    if (cmd.UserCallback == ImDrawCallback_ResetRenderState) { set_state(list, dd, width, height, vbytes, ibytes); bound = nullptr; }
+                    else cmd.UserCallback(dl, &cmd);
+                    continue;
+                }
+                const ImTextureData* tex = cmd.TexRef._TexData;
+                const Texture* t = tex ? static_cast<const Texture*>(tex->BackendUserData) : nullptr;
+                if (!t) continue;
+                const int32_t left = std::max(int32_t((cmd.ClipRect.x - dd->DisplayPos.x) * sx), 0);
+                const int32_t top = std::max(int32_t((cmd.ClipRect.y - dd->DisplayPos.y) * sy), 0);
+                const int32_t right = std::min(int32_t((cmd.ClipRect.z - dd->DisplayPos.x) * sx), int32_t(width));
+                const int32_t bottom = std::min(int32_t((cmd.ClipRect.w - dd->DisplayPos.y) * sy), int32_t(height));
+                if (left >= right || top >= bottom) continue;
+                if (t->set.get() != bound) { list->setGraphicsDescriptorSet(t->set.get(), 0); bound = t->set.get(); }
+                const RenderRect scissor(left, top, right, bottom);
+                list->setScissors(&scissor, 1);
+                list->drawIndexedInstanced(cmd.ElemCount, 1, ibase + cmd.IdxOffset, vbase + int32_t(cmd.VtxOffset), 0);
+            }
+            vbase += dl->VtxBuffer.Size;
+            ibase += dl->IdxBuffer.Size;
+        }
+    }
+
+    // Every texture goes with the device; ImGui asks for each again.
+    static void destroy_all() {
+        for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) if (tex->BackendUserData) destroy(tex);
+    }
+};
+
+std::unique_ptr<WebGPUOverlay> g_web;
+
+// A lost WebGPU device is replaced and RT64 makes everything again on the new one (rt64_render_hooks.h): first with
+// nullptrs, then with the new device.
+void hook_replace_device(RenderInterface*, RenderDevice* device) {
+    std::lock_guard lock{ g_mutex };
+    if (g_ctx) ImGui::SetCurrentContext(g_ctx);
+    if (!device) {
+        if (g_ctx) WebGPUOverlay::destroy_all();
+        g_web.reset();
+        g_device = nullptr;
+        return;
+    }
+    g_device = device;
+    if (g_backend_ready) g_web = std::make_unique<WebGPUOverlay>(device);
+}
+#else
 void vk_check(VkResult r) { if (r != VK_SUCCESS) fprintf(stderr, "[ui] Vulkan error %d\n", (int)r); }
+#endif
 
 void hook_init(RenderInterface*, RenderDevice* device) {
     g_device = device;
     g_api = Api::None;
+#ifdef __EMSCRIPTEN__
+    g_api = Api::WebGPU;
+    return;
+#endif
 #ifdef _WIN32
     if (dynamic_cast<plume::D3D12Device*>(device)) g_api = Api::D3D12;
 #endif
 #ifdef __APPLE__
     if (dynamic_cast<plume::MetalDevice*>(device)) g_api = Api::Metal;
 #endif
+#ifndef __EMSCRIPTEN__
     if (dynamic_cast<plume::VulkanDevice*>(device)) g_api = Api::Vulkan;
+#endif
     if (g_api == Api::None) fprintf(stderr, "[ui] unknown graphics API; the launcher and menu are unavailable\n");
 }
 
 // The backend is set up on the first present, when the swap chain's format is known.
 bool init_backend(RenderCommandList* list, RenderFramebuffer* fb) {
     switch (g_api) {
+#ifdef __EMSCRIPTEN__
+    case Api::WebGPU: {
+        ImGuiIO& io = ImGui::GetIO();
+        io.BackendRendererName = "n64frontend_plume_webgpu";
+        io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_RendererHasTextures;
+        g_web = std::make_unique<WebGPUOverlay>(g_device);
+        return true;
+    }
+#else
 #ifdef _WIN32
     case Api::D3D12: {
         auto* dev = static_cast<plume::D3D12Device*>(g_device);
@@ -140,6 +386,7 @@ bool init_backend(RenderCommandList* list, RenderFramebuffer* fb) {
         return ImGui_ImplMetal_CreateDeviceObjects(dev->mtl);
     }
 #endif
+#endif
     default: return false;
     }
 }
@@ -158,6 +405,11 @@ void hook_draw(RenderCommandList* list, RenderFramebuffer* fb) {
     ImDrawData* dd = ImGui::GetDrawData();
     if (!dd || !dd->Valid) return;
     switch (g_api) {
+#ifdef __EMSCRIPTEN__
+    case Api::WebGPU:
+        if (g_web) g_web->draw(list, dd, fb->getWidth(), fb->getHeight());
+        break;
+#else
 #ifdef _WIN32
     case Api::D3D12: {
         auto* cl = static_cast<plume::D3D12CommandList*>(list);
@@ -188,6 +440,7 @@ void hook_draw(RenderCommandList* list, RenderFramebuffer* fb) {
         break;
     }
 #endif
+#endif
     default: break;
     }
 }
@@ -197,12 +450,16 @@ void hook_deinit() {
     if (g_backend_ready) {
         ImGui::SetCurrentContext(g_ctx);
         switch (g_api) {
+#ifdef __EMSCRIPTEN__
+        case Api::WebGPU: WebGPUOverlay::destroy_all(); g_web.reset(); break;
+#else
 #ifdef _WIN32
         case Api::D3D12: ImGui_ImplDX12_Shutdown(); break;
 #endif
         case Api::Vulkan: ImGui_ImplVulkan_Shutdown(); break;
 #ifdef __APPLE__
         case Api::Metal: ImGui_ImplMetal_Shutdown(); break;
+#endif
 #endif
         default: break;
         }
@@ -228,6 +485,12 @@ ImGuiStyle g_base_style;
 
 std::string g_rom_error;
 char g_rom_path[1024] = "";
+#ifdef __EMSCRIPTEN__
+// Load ROM: the page's file picker blocks the thread that asks until the player picks, and the page's thread can't
+// wait, so a thread of its own asks and leaves the path here.
+std::atomic<int> g_pick = 0; // 0 nothing asked, 1 picking, 2 picked (g_picked, empty if cancelled)
+std::filesystem::path g_picked;
+#endif
 char g_join_address[256] = "";
 
 std::thread g_net_thread;
@@ -300,6 +563,26 @@ void launcher() {
     panel_begin("##launcher", 24);
     heading(g_game.title);
     if (!find_rom()) {
+#ifdef __EMSCRIPTEN__
+        if (g_pick == 2) {
+            if (!g_picked.empty()) {
+                import_rom(g_picked, g_rom_error); // librecomp keeps its own copy
+                std::error_code ec;
+                std::filesystem::remove(g_picked, ec);
+            }
+            g_pick = 0;
+        }
+        ImGui::TextWrapped("Load your %s ROM (USA, .z64). It stays in this browser.", g_game.title.c_str());
+        focus_first();
+        if (wide_button(g_pick ? "Choosing a ROM..." : "Load ROM") && g_pick == 0) {
+            g_pick = 1;
+            std::thread([] {
+                std::vector<std::filesystem::path> files = n64recomp_browser::pick_files(false, ".z64,.n64,.v64");
+                g_picked = files.empty() ? std::filesystem::path() : files[0];
+                g_pick = 2;
+            }).detach();
+        }
+#else
         ImGui::TextWrapped("Drop your %s ROM (USA, .z64) onto this window, or type where it is:", g_game.title.c_str());
         ImGui::SetNextItemWidth(-FLT_MIN);
         focus_first();
@@ -309,10 +592,13 @@ void launcher() {
             if (path.size() > 1 && path.front() == '"') path = path.substr(1, path.size() - 2);
             import_rom(path, g_rom_error);
         }
+#endif
         if (!g_rom_error.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", g_rom_error.c_str());
         ImGui::Spacing();
         if (wide_button("Settings")) { g_settings_back = Screen::Launcher; show(Screen::Settings); }
+#ifndef __EMSCRIPTEN__ // a page is left by closing its tab
         if (wide_button("Quit")) quit();
+#endif
         ImGui::End();
         return;
     }
@@ -335,9 +621,14 @@ void launcher() {
     ImGui::Spacing();
     ImGui::Separator();
     if (wide_button("Settings")) { g_settings_back = Screen::Launcher; show(Screen::Settings); }
+#ifdef __EMSCRIPTEN__
+    ImGui::Spacing();
+    ImGui::TextDisabled("Esc / Back: menu in game");
+#else
     if (wide_button("Quit")) quit();
     ImGui::Spacing();
     ImGui::TextDisabled("F11: fullscreen   Esc / Back: menu in game");
+#endif
     ImGui::End();
 }
 
@@ -448,13 +739,16 @@ void graphics_tab() {
         if (ImGui::SliderFloat("Multiplier", &m, 1.0f, 8.0f, "%.0fx")) { g_config.resolutionMultiplier = std::round(m); changed = true; }
     }
     changed |= combo("Aspect ratio", g_config.aspectRatio, { { "Original", "4:3 (original)" }, { "Expand", "Widescreen (experimental)" } });
+#ifndef __EMSCRIPTEN__ // a page draws without MSAA
     changed |= combo("Anti-aliasing", g_config.antialiasing, { { "None", "Off" }, { "MSAA2X", "MSAA 2x" },
         { "MSAA4X", "MSAA 4x" }, { "MSAA8X", "MSAA 8x" } });
+#endif
     changed |= combo("Filtering", g_config.filtering, { { "Nearest", "Nearest" }, { "Linear", "Linear" },
         { "AntiAliasedPixelScaling", "Sharp pixel scaling" } });
     changed |= combo("Frame rate", g_config.refreshRate, { { "Original", "60 Hz (original)" }, { "Display", "Match the display" } });
     if (changed) g_graphics_dirty = true;
 
+#ifndef __EMSCRIPTEN__ // a page fills the browser's window, and has no texture packs
     ImGui::Spacing();
     if (ImGui::Checkbox("Fullscreen (F11)", &g_config.fullscreen)) apply_window_config();
     int displays = SDL_GetNumVideoDisplays();
@@ -471,6 +765,7 @@ void graphics_tab() {
         }
     }
     ImGui::Checkbox("Texture packs (restart to apply)", &g_config.texturePacks);
+#endif
 }
 
 void sound_tab() {
@@ -519,7 +814,9 @@ void settings() {
         if (tab("Graphics")) { graphics_tab(); ImGui::EndTabItem(); }
         if (tab("Sound")) { sound_tab(); ImGui::EndTabItem(); }
         if (g_game.netplay && tab("Netplay")) { netplay_tab(); ImGui::EndTabItem(); }
+#ifndef __EMSCRIPTEN__ // cheats.cht is a file next to the game, which a page has nowhere to put
         if (tab("Cheats")) { cheats_tab(); ImGui::EndTabItem(); }
+#endif
         ImGui::EndTabBar();
         g_open_tab.clear();
     }
@@ -538,7 +835,9 @@ void menu() {
     focus_first();
     if (wide_button("Resume")) show(Screen::Hidden);
     if (wide_button("Settings")) { g_settings_back = Screen::Menu; show(Screen::Settings); }
+#ifndef __EMSCRIPTEN__
     if (wide_button("Quit game")) quit();
+#endif
     ImGui::End();
 }
 
@@ -617,6 +916,9 @@ void update_scale() {
 
 void ui_init() {
     RT64::SetRenderHooks(hook_init, hook_draw, hook_deinit);
+#ifdef __EMSCRIPTEN__
+    RT64::SetRenderHookReplaceDevice(hook_replace_device);
+#endif
     IMGUI_CHECKVERSION();
     ImGuiContext* prev = ImGui::GetCurrentContext();
     g_ctx = ImGui::CreateContext();
@@ -695,7 +997,9 @@ void ui_frame() {
 #ifdef _WIN32
     if (g_api == Api::D3D12) ImGui_ImplDX12_NewFrame();
 #endif
+#ifndef __EMSCRIPTEN__
     if (g_api == Api::Vulkan) ImGui_ImplVulkan_NewFrame();
+#endif
     // Metal starts its frame at draw time: it needs that present's render pass.
     ImGui_ImplSDL2_NewFrame();
     ImGui::GetIO().BackendFlags |= ImGuiBackendFlags_HasGamepad;

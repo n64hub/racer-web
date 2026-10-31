@@ -41,3 +41,9 @@ target_link_libraries(n64frontend PUBLIC librecomp ultramodern rt64 SDL2::SDL2)
 if(WIN32)
     target_link_libraries(n64frontend PUBLIC ws2_32 d3d12 dxgi)
 endif()
+if(EMSCRIPTEN)
+    # A page's sound output (audio_output.h: the page itself links it, n64recomp_browser_frontend_page in the root's
+    # CMakeLists.txt) and its file picker.
+    target_include_directories(n64frontend PRIVATE $<TARGET_PROPERTY:n64recomp_browser_frontend,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(n64frontend PUBLIC n64recomp_browser_file_picker)
+endif()

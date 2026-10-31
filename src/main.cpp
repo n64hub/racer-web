@@ -560,7 +560,9 @@ int main(int argc, char* argv[]) {
     game.controller_bindings["StickDown"] = { "dpdown" };
     game.controller_bindings["StickLeft"] = { "dpleft" };
     game.controller_bindings["StickRight"] = { "dpright" };
+#ifndef __EMSCRIPTEN__ // a page has no UDP sockets
     game.netplay = true;
+#endif
     // ponytail: the game's four OSThreads sit at fixed addresses; track osCreateThread if that changes.
     game.det_mask_words = { 0x000D7770, 0x000D7A20, 0x00149EF0, 0x0014B200 };
     game.det_ram_end = 0x00600000; // framebuffers (and RT64 write-backs) live above this

@@ -24,9 +24,17 @@ struct Config {
     std::string resolution = "WindowIntegerScale"; // Original | WindowIntegerScale | Manual
     double resolutionMultiplier = 2.0;             // used when resolution = Manual
     std::string aspectRatio = "Original";          // Original | Expand (widescreen)
+#ifdef __EMSCRIPTEN__
+    std::string antialiasing = "None";             // a page draws without MSAA
+#else
     std::string antialiasing = "MSAA4X";           // None | MSAA2X | MSAA4X | MSAA8X
+#endif
     std::string filtering = "AntiAliasedPixelScaling"; // Nearest | Linear | AntiAliasedPixelScaling
+#ifdef __EMSCRIPTEN__
+    std::string refreshRate = "Display";           // a page interpolates to the display's rate
+#else
     std::string refreshRate = "Original";          // Original (60 Hz) | Display
+#endif
     bool fullscreen = false;
     int windowWidth = 1280;
     int windowHeight = 960;

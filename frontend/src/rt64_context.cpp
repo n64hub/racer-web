@@ -14,6 +14,7 @@
 #include <string>
 
 #include "ultramodern/renderer_context.hpp"
+#include "ultramodern/displaylists.hpp"
 #include "librecomp/game.hpp"
 #include "config.hpp"
 #include "internal.hpp"
@@ -86,6 +87,20 @@ static void dummy_check_interrupts() {
     // No-op: ultramodern handles interrupts
 }
 
+#ifdef __EMSCRIPTEN__
+// With render to RAM's late copy, RT64 tells the game the RDP is done before it records and submits a list's workload,
+// so the game goes on meanwhile (ultramodern::renderer::rdp_done), once a game's task: never for a list RT64 draws by
+// itself.
+static bool s_sending_game_dl = false;
+
+static void rdp_done() {
+    if (s_sending_game_dl) {
+        s_sending_game_dl = false;
+        ultramodern::renderer::rdp_done();
+    }
+}
+#endif
+
 class RT64Context : public ultramodern::renderer::RendererContext {
 public:
     RT64Context(uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode)
@@ -103,6 +118,10 @@ public:
         uint32_t thread_id = window_handle.thread_id;
 #elif defined(__APPLE__)
         core.window = { window_handle.window, window_handle.view };
+        uint32_t thread_id = 0;
+#elif defined(__EMSCRIPTEN__)
+        // A page: RT64 draws on its canvas, the one SDL's window is.
+        core.window = "#canvas";
         uint32_t thread_id = 0;
 #elif defined(__ANDROID__)
         SDL_SysWMinfo wm;
@@ -160,6 +179,9 @@ public:
         core.VI_Y_SCALE_REG = &vi_regs_->VI_Y_SCALE_REG;
 
         core.checkInterrupts = dummy_check_interrupts;
+#ifdef __EMSCRIPTEN__
+        core.rdpDone = rdp_done;
+#endif
 
         // Configure RT64 application
         RT64::ApplicationConfiguration app_config;
@@ -170,6 +192,12 @@ public:
         // Create the RT64 Application
         printf("[rt64] Creating RT64 application...\n");
         app_ = std::make_unique<RT64::Application>(core, app_config);
+#ifdef __EMSCRIPTEN__
+        // Render to RAM, with each list's last copy landing a list late: in a browser the exact copy makes every list
+        // wait 5-6 ms for the GPU, and the game's CPU doesn't read a frame it has just drawn.
+        app_->emulatorConfig.framebuffer.renderToRAM = true;
+        app_->emulatorConfig.framebuffer.renderToRAMLate = true;
+#endif
         apply_graphics_config(app_->userConfig);
 
         // Run setup (creates graphics device, swap chain, shader caches, etc.)
@@ -182,9 +210,15 @@ public:
         switch (result) {
         case RT64::Application::SetupResult::Success:
             printf("[rt64] RT64 initialized successfully\n");
+#ifdef __EMSCRIPTEN__
+            // Where RT64 reads each display list's commands from, so a load from ROM can wait for a list it would
+            // land on (the web runtime's displaylists.cpp).
+            app_->state->displayListReads = ultramodern::displaylist_reads();
+#else
             if (g_config.texturePacks) {
                 load_texture_packs(*app_);
             }
+#endif
             is_valid_ = true;
             break;
         case RT64::Application::SetupResult::DynamicLibrariesNotFound:
@@ -244,7 +278,14 @@ public:
         uint32_t ucode_data = (uint32_t)task->t.ucode_data & 0x3FFFFFF;
         uint32_t dl_address = (uint32_t)task->t.data_ptr   & 0x3FFFFFF;
         app_->interpreter->loadUCodeGBI(ucode, ucode_data, true);
+#ifdef __EMSCRIPTEN__
+        s_sending_game_dl = true;
+#endif
         app_->processDisplayLists(rdram_, dl_address, 0, true);
+#ifdef __EMSCRIPTEN__
+        s_sending_game_dl = false;
+        ultramodern::displaylist_read();
+#endif
     }
 
     // ponytail: only sent before the game starts (dummy VI frames); nothing to draw yet.

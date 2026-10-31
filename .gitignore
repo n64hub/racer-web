@@ -52,3 +52,6 @@ rsp/aspMain.cpp
 build-*/
 builds/
 build-logs/
+
+# tools/build_web.sh: the web page's copy of this checkout, its libraries and build
+web-build/

@@ -1,3 +1,7 @@
 *.sh text eol=lf
 *.command text eol=lf
 *.tsv text eol=lf
+
+# The patches under patches/web/ are diffs of upstream files, some of them CRLF: stored byte for byte, whitespace and
+# all, so git apply reproduces them.
+*.patch -text -whitespace
