@@ -84,9 +84,3 @@ the boot (94) and Boonta Training Course (7).
 `tools/play_plan.json` (2-3 minutes) and `tools/play_plan_extended.json` (about 5) are the plays
 N64Recomp-browser's `tools/play_page.mjs` runs to test the page. A shader a longer play draws that the list misses
 (the page's console names it) goes into the list.
-
-## How it plays
-
-How the page plays in Chrome and Firefox, run by run, is recorded in N64Recomp-browser's
-[plays.jsonl](https://github.com/n64hub/N64Recomp-browser/blob/main/plays.jsonl) and its
-[games table](https://github.com/n64hub/N64Recomp-browser#games).
