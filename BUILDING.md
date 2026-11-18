@@ -12,7 +12,8 @@ on top:
 - `patches/web/N64ModernRuntime.patch`: the desktop runtime's fixes for this game (VI events before a mode is set,
   `osViSetMode`, `osPiReadIo`, `RECOMP_MEM_SIZE_MB`, `osGetCount`'s sign, save bounds, deterministic mode, RDRAM kept
   mapped).
-- `patches/web/rt64.patch`: the desktop RT64's VI modes whose framebuffer pixels are not square.
+- `patches/web/rt64.patch`: the desktop RT64's shape of a framebuffer's pixels on the TV (`VI::pixelAspect()`, from the
+  VI's regions) in place of the web support's (from its scales), and its framebuffer row width in `fbAddress()`.
 - `patches/web/rt64-imgui.patch`: upstream RT64's move to ImGui 1.92 (its "Add PNG texture dumping and Mac support for
   Inspector", less its Mac build files), which the desktop RT64 has, merged with the web support's shader changes, with
   RT64's ImGui and implot at the commits the desktop RT64 pins. The launcher and menus (`frontend/src/ui.cpp`) use
